@@ -11,13 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "env": {
-                "CUDA_VISIBLE_DEVICES": "0",
-                "HF_ENDPOINT": "https://hf-mirror.com",
-                "HF_HOME": "/data1/xujl/HF_CACHE",
-                "HF_TOKEN": "YOUR_TOKEN_HERE",
-                "WANDB_BASE_URL": "https://api.bandw.top"
-            },
+            "envFile": "${workspaceFolder}/.env",
         }
     ]
 }

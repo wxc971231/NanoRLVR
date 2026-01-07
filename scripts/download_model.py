@@ -32,6 +32,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # args.model = 'meta-llama/Llama-3.2-1B-Instruct'
+    # args.local_dir = "checkpoints/Llama-3.2-1B-Instruct"
 
     dtype_map = {
         "bf16": "bfloat16",
