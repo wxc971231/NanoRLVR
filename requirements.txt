@@ -1,5 +1,6 @@
-# Add dependencies here
-# torch
-# transformers
-# datasets
-# accelerate
+torch
+transformers
+datasets
+accelerate
+python-dotenv
+wandb

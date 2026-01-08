@@ -16,7 +16,8 @@ Optional:
 import os
 import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
+from dotenv import load_dotenv
+load_dotenv()
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -32,7 +33,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # args.model = 'meta-llama/Llama-3.2-1B-Instruct'
+    # args.model = 'unsloth/Llama-3.2-1B-Instruct'
     # args.local_dir = "checkpoints/Llama-3.2-1B-Instruct"
 
     dtype_map = {
@@ -42,7 +43,7 @@ def main():
     }
 
     print(f"[INFO] downloading tokenizer: {args.model}")
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False, legacy=False)
     print("[OK] tokenizer cached.")
 
     print(f"[INFO] downloading model weights: {args.model}")

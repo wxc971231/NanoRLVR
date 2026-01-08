@@ -39,7 +39,7 @@ def build_prompt(tok: AutoTokenizer, question: str) -> str:
     msgs = [
         {
             "role": "system",
-            "content": "请先推理，再在最后一行输出 `#### <最终答案>`，只输出一个最终答案。",
+            "content": "Please reason first, then output `#### <final_answer>` on the last line. Only output one final answer.",
         },
         {
             "role": "user",
@@ -87,7 +87,7 @@ def main():
 
     args.n = 2
     args.max_new_tokens = 512
-    args.model_dir = "checkpoints/Qwen3-1.7B"
+    args.model_dir = "checkpoints/Llama-3.2-1B-Instruct"
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
