@@ -12,6 +12,26 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "envFile": "${workspaceFolder}/.env",
-        }
+        },
+        {
+            "name": "Python: GRPO",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/data3/xujl/anaconda3/envs/rlvr/lib/python3.10/site-packages/torch/distributed/run.py",
+            "args":[
+                "--standalone",
+                "--nproc_per_node=gpu",
+                "--master_addr=localhost",
+                "--master_port=21662",
+                "./rl/GRPO.py"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6",
+                "HF_HOME": "/data1/xujl/HF_CACHE",
+                "WANDB_BASE_URL": "https://api.bandw.top"
+            },
+        },
     ]
 }
