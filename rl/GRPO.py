@@ -450,6 +450,7 @@ def parse_args():
     g_wandb = p.add_argument_group("Wandb")
     g_wandb.add_argument("--wandb_project", type=str, default="grpo-gsm8k", help="Wandb project name")
     g_wandb.add_argument("--wandb_group_enforce", type=str, default=None, help="If not set, use auto group name")
+    g_wandb.add_argument("--wandb_name_enforce", type=str, default=None, help="If not set, use auto name")
     g_wandb.add_argument("--wandb_offline", action="store_true", help="Run wandb in offline mode")
 
     # --- Group: LoRA ---
@@ -488,7 +489,8 @@ def main():
     exp_group_name = args.wandb_group_enforce if args.wandb_group_enforce is not None else \
                 f'GRPO-{args.model_path.split("/")[-1]}-LoRA' if args.use_lora else \
                 f'GRPO-{args.model_path.split("/")[-1]}'
-    args.save_dir =f'runs/{exp_group_name}/{timestamp}'
+    exp_name = args.wandb_name_enforce if args.wandb_name_enforce is not None else timestamp
+    args.save_dir =f'runs/{exp_group_name}/{exp_name}'
     
     # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, fix_mistral_regex=True)
@@ -575,8 +577,8 @@ def main():
     # wandb init    
     if is_main_rank() and wandb is not None:
         wandb.init(
-            project=args.wandb_project, group=exp_group_name, name=timestamp, 
-            config=vars(args), dir=f'Wandb', 
+            project=args.wandb_project, group=exp_group_name, name=exp_name, 
+            config=vars(args), dir=f'Wandb',
             id=wandb_id, resume='allow',
             mode="offline" if args.wandb_offline else "online",
         )
@@ -752,7 +754,7 @@ def main():
             # flush the gradients and skip update if non-finite grad exists
             if not assert_finite_grad(model):
                 optimizer.zero_grad(set_to_none=True)
-                clean_print(f"Skip step {step} due to non-finite grad", "[WARN]")
+                clean_print(f"Skip step{step}-epoch{epoch_i} due to non-finite grad", "[WARN]")
                 continue
             optimizer.step()
             assert_finite_model(model)
