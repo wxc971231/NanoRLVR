@@ -80,12 +80,9 @@ def rollout_ppo(
     all_attention_mask = tok["attention_mask"]
 
     # Generate in chunks to save memory
-    B = len(batch_questions)
-    chunk_results = []
-    
-    # Use tqdm for progress bar if main rank
-    rank = int(os.environ.get("RANK", "0"))
+    rank, B = int(os.environ.get("RANK", "0")), len(batch_questions)
     iterator = tqdm.tqdm(range(0, B, prompt_batch_size), desc=f"[Rank {rank}] Rollout", leave=False, position=rank)
+    chunk_results = []
     for start_idx in iterator:
         # Slice inputs and move to device
         end_idx = min(start_idx + prompt_batch_size, B)
@@ -93,13 +90,13 @@ def rollout_ppo(
         input_ids = all_input_ids[start_idx:end_idx].to(device)                 # [chunk_B, chunk_prompt_boundary]
         attention_mask = all_attention_mask[start_idx:end_idx].to(device)       # [chunk_B, chunk_prompt_boundary]
         
-        # 2. Repeat
+        # Repeat
         chunk_B, chunk_prompt_boundary = input_ids.size()
         input_ids_rep = input_ids.repeat_interleave(group_size, dim=0)          # [chunk_B*G, chunk_prompt_boundary]
         attn_rep = attention_mask.repeat_interleave(group_size, dim=0)          # [chunk_B*G, chunk_prompt_boundary]
         prompt_boundary_rep = torch.full((chunk_B * group_size,), chunk_prompt_boundary, device=device, dtype=torch.long) # [chunk_B*G,]
         
-        # 3. Generate
+        # Generate
         gen_model = model.module if hasattr(model, "module") else model
         with torch.autocast(device_type="cuda", dtype=autocast_dtype):
             out_ids = gen_model.generate(       # [chunk_B*G, max_traj_L]

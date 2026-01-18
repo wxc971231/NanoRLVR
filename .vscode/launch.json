@@ -17,7 +17,7 @@
             "name": "Python: GRPO",
             "type": "debugpy",
             "request": "launch",
-            "program": "/data3/xujl/anaconda3/envs/rlvr/lib/python3.10/site-packages/torch/distributed/run.py",
+            "module": "torch.distributed.run",
             "args":[
                 "--standalone",
                 "--nproc_per_node=gpu",
@@ -29,7 +29,26 @@
             "justMyCode": false,
             "envFile": "${workspaceFolder}/.env",
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5",
+            },
+        },
+        {
+            "name": "Python: PPO",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args":[
+                "--standalone",
+                "--nproc_per_node=gpu",
+                "--master_addr=localhost",
+                "--master_port=21662",
+                "./rl/PPO.py"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1",
             },
         },
     ]

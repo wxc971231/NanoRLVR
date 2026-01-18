@@ -25,9 +25,8 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from utils import *
 
@@ -37,25 +36,27 @@ from utils import *
 @dataclass
 class RolloutBatch:
     # flattened batch size N = B * G
-    input_ids: torch.Tensor                 # [B*G, max_traj_L]
-    attention_mask: torch.Tensor            # [B*G, max_traj_L]
-    prompt_lens: torch.Tensor               # [B*G]  (prompt boundary index, used for masking)
-    old_logp_sum: torch.Tensor              # [B*G]  (sum logp on completion tokens under π_old)
-    ref_logp_tok: Optional[torch.Tensor]    # [B*G, max_traj_L-1] token logp under π_ref (for KL); None if disabled
+    input_ids: torch.Tensor                 # [B*G, max_traj_len]
+    attention_mask: torch.Tensor            # [B*G, max_traj_len]
+    old_logp_tok: torch.Tensor              # [B*G, max_traj_len-1] token logp under π_old (for ratio)
+    ref_logp_tok: Optional[torch.Tensor]    # [B*G, max_traj_len-1] token logp under π_ref (for KL); None if disabled
+    completion_mask: torch.Tensor           # [B*G, max_traj_len-1] (completion token mask)
+    completion_lens: torch.Tensor           # [B*G] (number of completion tokens)
+    prompt_lens: torch.Tensor               # [B*G] (prompt boundary index, used for masking)
     rewards: torch.Tensor                   # [B*G]
     advantages: torch.Tensor                # [B*G]
-    completion_lens: torch.Tensor           # [B*G] (number of completion tokens)
-
+    
     def __getitem__(self, index):
         return RolloutBatch(
             input_ids=self.input_ids[index],
             attention_mask=self.attention_mask[index],
-            prompt_lens=self.prompt_lens[index],
-            old_logp_sum=self.old_logp_sum[index],
+            old_logp_tok=self.old_logp_tok[index],
             ref_logp_tok=self.ref_logp_tok[index] if self.ref_logp_tok is not None else None,
+            completion_mask=self.completion_mask[index],
+            completion_lens=self.completion_lens[index],
+            prompt_lens=self.prompt_lens[index],
             rewards=self.rewards[index],
             advantages=self.advantages[index],
-            completion_lens=self.completion_lens[index],
         )
 
 @torch.no_grad()
@@ -76,157 +77,46 @@ def rollout_grpo(
 ) -> RolloutBatch:
     """
     Generate G samples per prompt. Compute reward and group-normalized advantages.
-    Store old_logp_sum from π_old (current model at rollout time).
-    Optionally store ref token logp (for KL regularization).
+    Store old_logp_tok from π_old (current model at rollout time).
+    Optionally store ref_logp_tok from π_ref (for KL regularization).
     """
-    # 1. Build & Tokenize all prompts 
-    prompts_text = prepare_prompt(batch_questions, tokenizer)
-    tok = tokenizer(prompts_text, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length)
-    all_input_ids = tok["input_ids"]
-    all_attention_mask = tok["attention_mask"]
-
-    # Generate in chunks to save memory
-    B = len(batch_questions)
-    chunk_results = []
-    
-    # Use tqdm for progress bar if main rank
-    rank = int(os.environ.get("RANK", "0"))
-    iterator = tqdm.tqdm(range(0, B, prompt_batch_size), desc=f"[Rank {rank}] Rollout", leave=False, position=rank)
-    for start_idx in iterator:
-        # Slice inputs and move to device
-        end_idx = min(start_idx + prompt_batch_size, B)
-        a_chunk = batch_answers[start_idx:end_idx]
-        input_ids = all_input_ids[start_idx:end_idx].to(device)                 # [chunk_B, chunk_prompt_boundary]
-        attention_mask = all_attention_mask[start_idx:end_idx].to(device)       # [chunk_B, chunk_prompt_boundary]
-        
-        # 2. Repeat
-        chunk_B, chunk_prompt_boundary = input_ids.size()
-        input_ids_rep = input_ids.repeat_interleave(group_size, dim=0)          # [chunk_B*G, chunk_prompt_boundary]
-        attn_rep = attention_mask.repeat_interleave(group_size, dim=0)          # [chunk_B*G, chunk_prompt_boundary]
-        prompt_boundary_rep = torch.full((chunk_B * group_size,), chunk_prompt_boundary, device=device, dtype=torch.long) # [chunk_B*G,]
-        
-        # 3. Generate
-        gen_model = model.module if hasattr(model, "module") else model
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out_ids = gen_model.generate(       # [chunk_B*G, max_traj_L]
-                input_ids=input_ids_rep,
-                attention_mask=attn_rep,
-                num_return_sequences=1,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-            )
-            out_attn = (out_ids != tokenizer.pad_token_id).long()   # [chunk_B*G, max_traj_L]
-            texts = tokenizer.batch_decode(out_ids, skip_special_tokens=True)
-            
-        del input_ids, input_ids_rep, attn_rep  # Free memory
-        torch.cuda.empty_cache()                # Free memory
-        
-        # 4. Process outputs
-        rewards = []
-        for i in range(chunk_B):
-            for g in range(group_size):
-                idx = i * group_size + g
-                r = gsm8k_reward(texts[idx], a_chunk[i])
-                rewards.append(r)
-        rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)   # [chunk_B*G]
-
-        # Old logp
-        old_tok_logp = compute_token_logps(                                     # [chunk_B*G, max_traj_L]
-            model=gen_model,
-            input_ids=out_ids,
-            attention_mask=out_attn,
-            autocast_dtype=autocast_dtype,
-            require_grad=False,
-        )
-        comp_mask = build_completion_mask_targets(out_attn, prompt_boundary_rep)# [chunk_B*G, max_traj_L]
-        old_logp_sum = (old_tok_logp * comp_mask).sum(dim=1)                    # [chunk_B*G,]
-        completion_lens = comp_mask.sum(dim=1)                                  # [chunk_B*G]
-        
-        # Ref logp
-        ref_logp_tok = None
-        if ref_model is not None and kl_beta > 0.0:
-            ref_logp_tok = compute_token_logps(
-                model=ref_model,
-                input_ids=out_ids,
-                attention_mask=out_attn,
-                autocast_dtype=autocast_dtype,
-                require_grad=False,
-            )
-            
-        chunk_results.append({
-            "out_ids": out_ids,                 # [chunk_B*G, max_traj_L]
-            "out_attn": out_attn,               # [chunk_B*G, max_traj_L]
-            "prompt_lens": prompt_boundary_rep, # [chunk_B*G, ]
-            "old_logp_sum": old_logp_sum,       # [chunk_B*G, ]
-            "ref_logp_tok": ref_logp_tok,       # [chunk_B*G, max_traj_L] or None
-            "rewards": rewards_t,               # [chunk_B*G, ]
-            "completion_lens": completion_lens, # [chunk_B*G, ]
-        })
-        
-    # Combine results
-    # Find max sequence length across all chunks
-    max_seq_len = max(res["out_ids"].size(1) for res in chunk_results)
-    
-    all_out_ids = []
-    all_out_attn = []
-    all_prompt_lens = []
-    all_old_logp_sum = []
-    all_ref_logp_tok = []
-    all_rewards = []
-    all_completion_lens = []
-    for res in chunk_results:
-        # Pad out_ids and out_attn
-        curr_len = res["out_ids"].size(1)
-        pad_len = max_seq_len - curr_len
-        if pad_len > 0:
-            padded_ids = F.pad(res["out_ids"], (0, pad_len), value=tokenizer.pad_token_id)
-            padded_attn = F.pad(res["out_attn"], (0, pad_len), value=0)
-            # Handle ref_logp_tok if exists (shape [N, L-1])    
-            padded_ref = None if res["ref_logp_tok"] is None else F.pad(res["ref_logp_tok"], (0, pad_len), value=0.0)
-        else:
-            padded_ids = res["out_ids"]
-            padded_attn = res["out_attn"]
-            padded_ref = res["ref_logp_tok"]
-        all_out_ids.append(padded_ids)
-        all_out_attn.append(padded_attn)
-        all_prompt_lens.append(res["prompt_lens"])
-        all_old_logp_sum.append(res["old_logp_sum"])
-        all_rewards.append(res["rewards"])
-        all_completion_lens.append(res["completion_lens"])
-        if padded_ref is not None:
-            all_ref_logp_tok.append(padded_ref)
-
-    final_input_ids = torch.cat(all_out_ids, dim=0)                 # [B*G, max_traj_L]
-    final_attn = torch.cat(all_out_attn, dim=0)                     # [B*G, max_traj_L]
-    final_prompt_lens = torch.cat(all_prompt_lens, dim=0)           # [B*G, ]
-    final_old_logp_sum = torch.cat(all_old_logp_sum, dim=0)         # [B*G, ]
-    final_ref_logp_tok = torch.cat(all_ref_logp_tok, dim=0) if all_ref_logp_tok else None  # [B*G, max_traj_L-1]
-    final_rewards = torch.cat(all_rewards, dim=0)                   # [B*G, ]
-    final_completion_lens = torch.cat(all_completion_lens, dim=0)   # [B*G, ]
+    # Rollout G samples per prompt
+    all_chunk_res:Dict[str, torch.Tensor] = rollout(
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        batch_questions=batch_questions,
+        batch_answers=batch_answers,
+        group_size=group_size,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        kl_beta=kl_beta,
+        autocast_dtype=autocast_dtype,
+        device=device,
+        prompt_batch_size=prompt_batch_size,
+    )
 
     # GRPO advantages: group-wise baseline & std normalization if std is non-trivial
-    # Note that group_answer of same prompt located on same GPU, no need to gather
-    r_group = final_rewards.view(B, group_size)                     # [B, G]
-    mean = r_group.mean(dim=1, keepdim=True)                        # [B, 1]
-    std = r_group.std(dim=1, keepdim=True, unbiased=False)          # [B, 1]
-    adv = (r_group - mean)                                          # [B, G]
-    adv = torch.where(std > 1e-6, adv / (std + 1e-6), adv)          # [B, G]
-    advantages = adv.view(B * group_size)                           # [B*G]
+    # NOTE that group_answer of same prompt located on same GPU, no need to gather
+    B = len(batch_questions)
+    r_group = all_chunk_res['rewards'].view(B, group_size)  # [B, G]
+    mean = r_group.mean(dim=1, keepdim=True)                # [B, 1]
+    std = r_group.std(dim=1, keepdim=True, unbiased=False)  # [B, 1]
+    adv = (r_group - mean)                                  # [B, G]
+    adv = torch.where(std > 1e-6, adv / (std + 1e-6), adv)  # [B, G]
+    advantages = adv.view(B * group_size)                   # [B*G]
 
     return RolloutBatch(
-        input_ids=final_input_ids,              # [B*G, max_traj_L]
-        attention_mask=final_attn,              # [B*G, max_traj_L]
-        prompt_lens=final_prompt_lens,          # [B*G]
-        old_logp_sum=final_old_logp_sum,        # [B*G]
-        ref_logp_tok=final_ref_logp_tok,        # [B*G, max_traj_L-1]
-        rewards=final_rewards,                  # [B*G]
-        advantages=advantages,                  # [B*G]
-        completion_lens=final_completion_lens,  # [B*G]
+        input_ids=all_chunk_res['out_ids'],                 # [B*G, max_traj_len]
+        attention_mask=all_chunk_res['out_attn'],           # [B*G, max_traj_len]
+        old_logp_tok=all_chunk_res['old_logp_tok'],         # [B*G, max_traj_len-1]
+        ref_logp_tok=all_chunk_res['ref_logp_tok'],         # [B*G, max_traj_len-1]
+        completion_mask=all_chunk_res['completion_mask'],   # [B*G, max_traj_len-1]
+        completion_lens=all_chunk_res['completion_lens'],   # [B*G]
+        prompt_lens=all_chunk_res['prompt_lens'],           # [B*G]
+        rewards=all_chunk_res['rewards'],                   # [B*G]
+        advantages=advantages,                              # [B*G]
     )
 
 # ---------------------------
@@ -245,18 +135,19 @@ def grpo_loss(
     Uses sequence-level ratio = exp(sum_logp_new - sum_logp_old).
     KL is estimated on sampled tokens: mean over completion tokens of (logp_new - logp_ref).
     """
-    tok_logp_new = compute_token_logps(                 # [N, L-1]
+    tok_logp_new = compute_token_logps(                     # [N, L-1]
         model=model,
         input_ids=batch.input_ids,
         attention_mask=batch.attention_mask,
         autocast_dtype=autocast_dtype,
         require_grad=True,
     )  
+    tok_logp_old = batch.old_logp_tok.detach()              # [N, L-1]
     
     # sum logp on completion tokens
-    comp_mask = build_completion_mask_targets(batch.attention_mask, batch.prompt_lens)  # [N, L-1]
-    logp_new_sum = (tok_logp_new * comp_mask).sum(dim=1)  # [N]
-    logp_old_sum = batch.old_logp_sum.detach()            # [N]
+    comp_mask = batch.completion_mask                       # [N, L-1]
+    logp_new_sum = (tok_logp_new * comp_mask).sum(dim=1)    # [N]
+    logp_old_sum = (tok_logp_old * comp_mask).sum(dim=1)    # [N]
 
     # ratio: support optional length-normalization to stabilize long sequences
     if ratio_len_norm:
@@ -298,81 +189,6 @@ def grpo_loss(
         "len_mean": batch.completion_lens.float().mean().detach(),
     }
     return loss, stats
-
-# ---------------------------
-# evaluation
-# ---------------------------
-@torch.no_grad()
-def evaluate_greedy(
-    model: nn.Module,
-    tokenizer: AutoTokenizer,
-    dataloader: DataLoader,
-    device: Union[int, torch.device],
-    autocast_dtype: torch.dtype,
-    max_new_tokens: int,
-    eval_batches: int,
-) -> Dict[str, float]:
-    model_eval = model.module if hasattr(model, "module") else model
-    model_eval.eval()
-
-    # Only show progress bar on main rank
-    correct, total = 0, 0
-    total_gen_len, total_gen_cnt = 0.0, 0.0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    
-    iterator = dataloader if not is_main_rank() else tqdm.tqdm(dataloader, desc=f"[GPU0-{world_size-1}]: Evaluating", leave=False)
-    for b, items in enumerate(iterator):
-        if b >= eval_batches:
-            break
-
-        questions = list(items["question"])
-        answers = list(items["answer"])
-        
-        prompts_text = prepare_prompt(questions, tokenizer)
-        tok = tokenizer(prompts_text, return_tensors="pt", padding=True, truncation=True)
-        input_ids = tok["input_ids"].to(device)
-        attn = tok["attention_mask"].to(device)
-
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out = model_eval.generate(
-                input_ids=input_ids,    # [B*G, L]
-                attention_mask=attn,    # [B*G, L]
-                do_sample=False,
-                temperature=None,
-                top_k=None,
-                top_p=None,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,         # Force use_cache=True during rollout for speed, even if gradient checkpointing disables it globally
-            )
-
-        pad_id = tokenizer.pad_token_id
-        input_valid = (input_ids != pad_id).sum(dim=1)
-        out_valid = (out != pad_id).sum(dim=1)
-        comp_len = (out_valid - input_valid).clamp(min=0)
-        total_gen_len += comp_len.sum().item()
-        total_gen_cnt += float(comp_len.numel())
-
-        texts = tokenizer.batch_decode(out, skip_special_tokens=True)
-        for t, gt in zip(texts, answers):
-            r = gsm8k_reward(t, gt)
-            correct += int(r > 0.5)   # gsm8k_reward ∈ {0.0,1.0}，用 >0.5 保证可扩展性（比如做了平滑）
-            total += 1
-
-    corr_t = torch.tensor([correct], device=device, dtype=torch.float32)
-    tot_t = torch.tensor([total], device=device, dtype=torch.float32)
-    len_t = torch.tensor([total_gen_len], device=device, dtype=torch.float32)
-    cnt_t = torch.tensor([total_gen_cnt], device=device, dtype=torch.float32)
-    corr_t = ddp_all_reduce_sum(corr_t)
-    tot_t = ddp_all_reduce_sum(tot_t)
-    len_t = ddp_all_reduce_sum(len_t)
-    cnt_t = ddp_all_reduce_sum(cnt_t)
-
-    acc = (corr_t / tot_t).item() if tot_t.item() > 0 else 0.0
-    avg_len = (len_t / cnt_t).item() if cnt_t.item() > 0 else 0.0
-    model_eval.train()
-    return {"greedy_acc": acc, "avg_completion_len": avg_len}
 
 # ---------------------------
 # main
@@ -468,20 +284,11 @@ def parse_args():
 
 def main():
     # DDP init
-    assert ddp_is_on(), "Only DDP mode is supported"
-    num_cores = os.cpu_count()
-    num_threads = max(1, min(16, num_cores // 2))    # Each process uses part of the CPU cores
-    os.environ["OMP_NUM_THREADS"] = str(num_threads)
-    dist.init_process_group(backend="nccl")
-    RANK = int(os.environ["RANK"])
-    LOCAL_RANK = int(os.environ["LOCAL_RANK"])
-    WORLD_SIZE = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(LOCAL_RANK)
-    
+    RANK, LOCAL_RANK, WORLD_SIZE = ddp_init()
+
     # args
     args = parse_args()
     autocast_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    best_performance = float('-inf')
     set_seed(args.seed + RANK)
 
     # save setting
@@ -497,6 +304,12 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"  # Required for generation to work properly with variable length prompts
+
+    # data
+    train_loader, eval_loader, train_sampler, _ = build_data_component(
+        args.train_jsonl, args.test_jsonl, args.batch_size, args.eval_batch_size, args.seed
+    )
+    train_iter = iter(train_loader)
 
     # model
     model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=autocast_dtype, low_cpu_mem_usage=True).to(LOCAL_RANK)
@@ -514,32 +327,7 @@ def main():
         for p_ in ref_model.parameters():
             p_.requires_grad_(False)
 
-    # data
-    train_set = GSM8KJsonl(args.train_jsonl)
-    test_set = GSM8KJsonl(args.test_jsonl)
-    train_sampler = DistributedSampler(train_set, shuffle=True, seed=args.seed)
-    eval_sampler = DistributedSampler(test_set, shuffle=False, seed=args.seed)  # no shuffle to fix eval subset
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        drop_last=True,
-        num_workers=0,
-        pin_memory=True,
-        collate_fn=lambda x: x, # keep raw strings; build prompts later
-    )
-    eval_loader = DataLoader(
-        test_set,
-        batch_size=args.eval_batch_size,
-        sampler=eval_sampler,
-        shuffle=False,
-        drop_last=False,
-        num_workers=0,
-    )
-    train_iter = iter(train_loader)
-    
-    # Only optimize trainable parameters (important if LoRA)
+    # optimizer: Only optimize trainable parameters (important if LoRA)
     optim_params = [p for p in (model.parameters()) if p.requires_grad]
     optimizer = build_optimizer(optim_params, args.lr, args.weight_decay, args.optim)
 
@@ -569,7 +357,7 @@ def main():
             with open(f"{args.save_dir}/grpo_config.json", 'w') as f:
                 json.dump(config_data, f, indent=4)
         
-        step_begin = 0
+        step_begin = 1
         wandb_id = wandb.util.generate_id()     # This unique id is necessary for log resuming
         best_performance = float('-inf')
         clean_print(f"Snapshot not found. Training model from scratch", '[Trainer]')
@@ -638,14 +426,14 @@ def main():
                 "step": step,
                 "model_state_dict": model.module.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "wandb_id": (wandb.run.id if (wandb is not None and wandb.run is not None) else None),
+                "best_performance": best_performance,
                 "rng_states": {
                     "python": random.getstate(),
                     "numpy": (np.random.get_state() if np is not None else None),
                     "torch": torch.get_rng_state(),
                     "torch_cuda": torch.cuda.get_rng_state_all(),
                 },
-                "wandb_id": (wandb.run.id if (wandb is not None and wandb.run is not None) else None),
-                "best_performance": best_performance,
             }
             torch.save(snapshot, os.path.join(args.save_dir, f"snapshot_seed{args.seed}.pt"))
 
