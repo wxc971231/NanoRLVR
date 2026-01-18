@@ -33,32 +33,6 @@ from utils import *
 # ---------------------------
 # GRPO rollout
 # ---------------------------
-@dataclass
-class RolloutBatch:
-    # flattened batch size N = B * G
-    input_ids: torch.Tensor                 # [B*G, max_traj_len]
-    attention_mask: torch.Tensor            # [B*G, max_traj_len]
-    old_logp_tok: torch.Tensor              # [B*G, max_traj_len-1] token logp under π_old (for ratio)
-    ref_logp_tok: Optional[torch.Tensor]    # [B*G, max_traj_len-1] token logp under π_ref (for KL); None if disabled
-    completion_mask: torch.Tensor           # [B*G, max_traj_len-1] (completion token mask)
-    completion_lens: torch.Tensor           # [B*G] (number of completion tokens)
-    prompt_lens: torch.Tensor               # [B*G] (prompt boundary index, used for masking)
-    rewards: torch.Tensor                   # [B*G]
-    advantages: torch.Tensor                # [B*G]
-    
-    def __getitem__(self, index):
-        return RolloutBatch(
-            input_ids=self.input_ids[index],
-            attention_mask=self.attention_mask[index],
-            old_logp_tok=self.old_logp_tok[index],
-            ref_logp_tok=self.ref_logp_tok[index] if self.ref_logp_tok is not None else None,
-            completion_mask=self.completion_mask[index],
-            completion_lens=self.completion_lens[index],
-            prompt_lens=self.prompt_lens[index],
-            rewards=self.rewards[index],
-            advantages=self.advantages[index],
-        )
-
 @torch.no_grad()
 def rollout_grpo(
     model: nn.Module,
@@ -96,6 +70,7 @@ def rollout_grpo(
         device=device,
         prompt_batch_size=prompt_batch_size,
     )
+    ref_logp_tok = all_chunk_res['ref_logp_tok'] if 'ref_logp_tok' in all_chunk_res else None
 
     # GRPO advantages: group-wise baseline & std normalization if std is non-trivial
     # NOTE that group_answer of same prompt located on same GPU, no need to gather
@@ -103,15 +78,15 @@ def rollout_grpo(
     r_group = all_chunk_res['rewards'].view(B, group_size)  # [B, G]
     mean = r_group.mean(dim=1, keepdim=True)                # [B, 1]
     std = r_group.std(dim=1, keepdim=True, unbiased=False)  # [B, 1]
-    adv = (r_group - mean)                                  # [B, G]
+    adv = r_group - mean                                    # [B, G]
     adv = torch.where(std > 1e-6, adv / (std + 1e-6), adv)  # [B, G]
     advantages = adv.view(B * group_size)                   # [B*G]
-
+    
     return RolloutBatch(
         input_ids=all_chunk_res['out_ids'],                 # [B*G, max_traj_len]
         attention_mask=all_chunk_res['out_attn'],           # [B*G, max_traj_len]
         old_logp_tok=all_chunk_res['old_logp_tok'],         # [B*G, max_traj_len-1]
-        ref_logp_tok=all_chunk_res['ref_logp_tok'],         # [B*G, max_traj_len-1]
+        ref_logp_tok=ref_logp_tok,                          # [B*G, max_traj_len-1] or None
         completion_mask=all_chunk_res['completion_mask'],   # [B*G, max_traj_len-1]
         completion_lens=all_chunk_res['completion_lens'],   # [B*G]
         prompt_lens=all_chunk_res['prompt_lens'],           # [B*G]
@@ -135,7 +110,7 @@ def grpo_loss(
     Uses sequence-level ratio = exp(sum_logp_new - sum_logp_old).
     KL is estimated on sampled tokens: mean over completion tokens of (logp_new - logp_ref).
     """
-    tok_logp_new = compute_token_logps(                     # [N, L-1]
+    tok_logp_new, _ = compute_token_logps_and_values(       # [N, L-1]
         model=model,
         input_ids=batch.input_ids,
         attention_mask=batch.attention_mask,
@@ -577,6 +552,8 @@ def main():
     clean_print("Done.", "[INFO]")
     if is_main_rank() and wandb is not None and wandb.run is not None:
         wandb.finish()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

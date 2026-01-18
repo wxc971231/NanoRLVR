@@ -24,34 +24,6 @@ from utils import *
 # ---------------------------
 # PPO rollout
 # ---------------------------
-@dataclass
-class RolloutBatch:
-    # flattened batch size N = B * G
-    input_ids: torch.Tensor                 # [B*G, max_traj_L]
-    attention_mask: torch.Tensor            # [B*G, max_traj_L]
-    prompt_lens: torch.Tensor               # [B*G]  (prompt boundary index, used for masking)
-    old_logp_sum: torch.Tensor              # [B*G]  (sum logp on completion tokens under π_old)
-    ref_logp_tok: Optional[torch.Tensor]    # [B*G, max_traj_L-1] token logp under π_ref (for KL); None if disabled
-    rewards: torch.Tensor                   # [B*G]
-    values: torch.Tensor                    # [B*G]
-    returns: torch.Tensor                   # [B*G]
-    advantages: torch.Tensor                # [B*G]
-    completion_lens: torch.Tensor           # [B*G] (number of completion tokens)
-
-    def __getitem__(self, index):
-        return RolloutBatch(
-            input_ids=self.input_ids[index],
-            attention_mask=self.attention_mask[index],
-            prompt_lens=self.prompt_lens[index],
-            old_logp_sum=self.old_logp_sum[index],
-            ref_logp_tok=self.ref_logp_tok[index] if self.ref_logp_tok is not None else None,
-            rewards=self.rewards[index],
-            values=self.values[index],
-            returns=self.returns[index],
-            advantages=self.advantages[index],
-            completion_lens=self.completion_lens[index],
-        )
-
 @torch.no_grad()
 def rollout_ppo(
     model: nn.Module,
@@ -73,201 +45,47 @@ def rollout_ppo(
     Store old_logp_sum from π_old (current model at rollout time).
     Optionally store ref token logp (for KL regularization).
     """
-    # 1. Build & Tokenize all prompts 
-    prompts_text = prepare_prompt(batch_questions, tokenizer)
-    tok = tokenizer(prompts_text, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length)
-    all_input_ids = tok["input_ids"]
-    all_attention_mask = tok["attention_mask"]
-
-    # Generate in chunks to save memory
-    rank, B = int(os.environ.get("RANK", "0")), len(batch_questions)
-    iterator = tqdm.tqdm(range(0, B, prompt_batch_size), desc=f"[Rank {rank}] Rollout", leave=False, position=rank)
-    chunk_results = []
-    for start_idx in iterator:
-        # Slice inputs and move to device
-        end_idx = min(start_idx + prompt_batch_size, B)
-        a_chunk = batch_answers[start_idx:end_idx]
-        input_ids = all_input_ids[start_idx:end_idx].to(device)                 # [chunk_B, chunk_prompt_boundary]
-        attention_mask = all_attention_mask[start_idx:end_idx].to(device)       # [chunk_B, chunk_prompt_boundary]
-        
-        # Repeat
-        chunk_B, chunk_prompt_boundary = input_ids.size()
-        input_ids_rep = input_ids.repeat_interleave(group_size, dim=0)          # [chunk_B*G, chunk_prompt_boundary]
-        attn_rep = attention_mask.repeat_interleave(group_size, dim=0)          # [chunk_B*G, chunk_prompt_boundary]
-        prompt_boundary_rep = torch.full((chunk_B * group_size,), chunk_prompt_boundary, device=device, dtype=torch.long) # [chunk_B*G,]
-        
-        # Generate
-        gen_model = model.module if hasattr(model, "module") else model
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out_ids = gen_model.generate(       # [chunk_B*G, max_traj_L]
-                input_ids=input_ids_rep,
-                attention_mask=attn_rep,
-                num_return_sequences=1,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-            )
-            out_attn = (out_ids != tokenizer.pad_token_id).long()   # [chunk_B*G, max_traj_L]
-            texts = tokenizer.batch_decode(out_ids, skip_special_tokens=True)
-            
-        del input_ids, input_ids_rep, attn_rep  # Free memory
-        torch.cuda.empty_cache()                # Free memory
-        
-        # 4. Process outputs
-        rewards = []
-        for i in range(chunk_B):
-            for g in range(group_size):
-                idx = i * group_size + g
-                r = gsm8k_reward(texts[idx], a_chunk[i])
-                rewards.append(r)
-        rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)   # [chunk_B*G]
-
-        # Old logp
-        old_tok_logp = compute_token_logps(                                     # [chunk_B*G, max_traj_L]
-            model=gen_model,
-            input_ids=out_ids,
-            attention_mask=out_attn,
-            autocast_dtype=autocast_dtype,
-            require_grad=False,
-        )
-        comp_mask = build_completion_mask_targets(out_attn, prompt_boundary_rep)# [chunk_B*G, max_traj_L]
-        old_logp_sum = (old_tok_logp * comp_mask).sum(dim=1)                    # [chunk_B*G,]
-        completion_lens = comp_mask.sum(dim=1)                                  # [chunk_B*G]
-        
-        # Critic values
-        values_t = compute_values(
-            model=model,
-            input_ids=out_ids,
-            attention_mask=out_attn,
-            autocast_dtype=autocast_dtype,
-            require_grad=False,
-        )
-        
-        # Ref logp
-        ref_logp_tok = None
-        if ref_model is not None and kl_beta > 0.0:
-            ref_logp_tok = compute_token_logps(
-                model=ref_model,
-                input_ids=out_ids,
-                attention_mask=out_attn,
-                autocast_dtype=autocast_dtype,
-                require_grad=False,
-            )
-            
-        chunk_results.append({
-            "out_ids": out_ids,                 # [chunk_B*G, max_traj_L]
-            "out_attn": out_attn,               # [chunk_B*G, max_traj_L]
-            "prompt_lens": prompt_boundary_rep, # [chunk_B*G, ]
-            "old_logp_sum": old_logp_sum,       # [chunk_B*G, ]
-            "ref_logp_tok": ref_logp_tok,       # [chunk_B*G, max_traj_L] or None
-            "rewards": rewards_t,               # [chunk_B*G, ]
-            "values": values_t,                 # [chunk_B*G, ]
-            "completion_lens": completion_lens, # [chunk_B*G, ]
-        })
-        
-    # Combine results
-    # Find max sequence length across all chunks
-    max_seq_len = max(res["out_ids"].size(1) for res in chunk_results)
-    
-    all_out_ids = []
-    all_out_attn = []
-    all_prompt_lens = []
-    all_old_logp_sum = []
-    all_ref_logp_tok = []
-    all_rewards = []
-    all_values = []
-    all_completion_lens = []
-    for res in chunk_results:
-        # Pad out_ids and out_attn
-        curr_len = res["out_ids"].size(1)
-        pad_len = max_seq_len - curr_len
-        if pad_len > 0:
-            padded_ids = F.pad(res["out_ids"], (0, pad_len), value=tokenizer.pad_token_id)
-            padded_attn = F.pad(res["out_attn"], (0, pad_len), value=0)
-            # Handle ref_logp_tok if exists (shape [N, L-1])    
-            padded_ref = None if res["ref_logp_tok"] is None else F.pad(res["ref_logp_tok"], (0, pad_len), value=0.0)
-        else:
-            padded_ids = res["out_ids"]
-            padded_attn = res["out_attn"]
-            padded_ref = res["ref_logp_tok"]
-        all_out_ids.append(padded_ids)
-        all_out_attn.append(padded_attn)
-        all_prompt_lens.append(res["prompt_lens"])
-        all_old_logp_sum.append(res["old_logp_sum"])
-        all_rewards.append(res["rewards"])
-        all_values.append(res["values"])
-        all_completion_lens.append(res["completion_lens"])
-        if padded_ref is not None:
-            all_ref_logp_tok.append(padded_ref)
-
-    final_input_ids = torch.cat(all_out_ids, dim=0)                 # [B*G, max_traj_L]
-    final_attn = torch.cat(all_out_attn, dim=0)                     # [B*G, max_traj_L]
-    final_prompt_lens = torch.cat(all_prompt_lens, dim=0)           # [B*G, ]
-    final_old_logp_sum = torch.cat(all_old_logp_sum, dim=0)         # [B*G, ]
-    final_ref_logp_tok = torch.cat(all_ref_logp_tok, dim=0) if all_ref_logp_tok else None  # [B*G, max_traj_L-1]
-    final_rewards = torch.cat(all_rewards, dim=0)                   # [B*G, ]
-    final_values = torch.cat(all_values, dim=0)                     # [B*G, ]
-    final_completion_lens = torch.cat(all_completion_lens, dim=0)   # [B*G, ]
+    # Rollout G samples per prompt
+    all_chunk_res:Dict[str, torch.Tensor] = rollout(
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        batch_questions=batch_questions,
+        batch_answers=batch_answers,
+        group_size=group_size,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        kl_beta=kl_beta,
+        autocast_dtype=autocast_dtype,
+        device=device,
+        prompt_batch_size=prompt_batch_size,
+    )
+    ref_logp_tok = all_chunk_res['ref_logp_tok'] if 'ref_logp_tok' in all_chunk_res else None
 
     # PPO advantages: value baseline & std normalization if std is non-trivial
-    returns = final_rewards                                         # [B*G]
-    advantages = returns - final_values                             # [B*G]
+    returns = all_chunk_res['rewards']                              # [B*G]
+    critic_values = all_chunk_res['critic_values']                  # [B*G]
+    advantages = returns - critic_values                            # [B*G]
     adv_mean = advantages.mean()
     adv_std = advantages.std(dim=0, unbiased=False)
     advantages = torch.where(adv_std > 1e-6, (advantages - adv_mean) / (adv_std + 1e-6), advantages - adv_mean)
 
     return RolloutBatch(
-        input_ids=final_input_ids,              # [B*G, max_traj_L]
-        attention_mask=final_attn,              # [B*G, max_traj_L]
-        prompt_lens=final_prompt_lens,          # [B*G]
-        old_logp_sum=final_old_logp_sum,        # [B*G]
-        ref_logp_tok=final_ref_logp_tok,        # [B*G, max_traj_L-1]
-        rewards=final_rewards,                  # [B*G]
-        values=final_values,                    # [B*G]
-        returns=returns,                        # [B*G]
-        advantages=advantages,                  # [B*G]
-        completion_lens=final_completion_lens,  # [B*G]
+        input_ids=all_chunk_res['out_ids'],                 # [B*G, max_traj_len]
+        attention_mask=all_chunk_res['out_attn'],           # [B*G, max_traj_len]
+        old_logp_tok=all_chunk_res['old_logp_tok'],         # [B*G, max_traj_len-1]
+        ref_logp_tok=ref_logp_tok,                          # [B*G, max_traj_len-1] or None
+        completion_mask=all_chunk_res['completion_mask'],   # [B*G, max_traj_len-1]
+        completion_lens=all_chunk_res['completion_lens'],   # [B*G]
+        prompt_lens=all_chunk_res['prompt_lens'],           # [B*G]
+        rewards=all_chunk_res['rewards'],                   # [B*G]
+        advantages=advantages,                              # [B*G]
     )
-
 
 # ---------------------------
 # PPO loss
 # ---------------------------
-def compute_values(
-    model: nn.Module,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    autocast_dtype: torch.dtype,
-    require_grad: bool,
-) -> torch.Tensor:
-    base_model = model.module if hasattr(model, "module") else model
-    if require_grad:
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out = base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
-            )
-            hidden = out.hidden_states[-1]
-            values = base_model.v_head(hidden[:, -1, :]).squeeze(-1)
-    else:
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                out = base_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
-                hidden = out.hidden_states[-1]
-                values = base_model.v_head(hidden[:, -1, :]).squeeze(-1)
-    return values
-
 def ppo_loss(
     model: nn.Module,
     batch: RolloutBatch,
@@ -512,15 +330,7 @@ def parse_args():
 
 def main():
     # DDP init
-    assert ddp_is_on(), "Only DDP mode is supported"
-    num_cores = os.cpu_count()
-    num_threads = max(1, min(16, num_cores // 2))
-    os.environ["OMP_NUM_THREADS"] = str(num_threads)
-    dist.init_process_group(backend="nccl")
-    RANK = int(os.environ["RANK"])
-    LOCAL_RANK = int(os.environ["LOCAL_RANK"])
-    WORLD_SIZE = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(LOCAL_RANK)
+    RANK, LOCAL_RANK, WORLD_SIZE = ddp_init()
 
     # args
     args = parse_args()
@@ -618,7 +428,7 @@ def main():
             with open(f"{args.save_dir}/ppo_config.json", "w") as f:
                 json.dump(config_data, f, indent=4)
 
-        step_begin = 0
+        step_begin = 1
         wandb_id = wandb.util.generate_id() # This unique id is necessary for log resuming
         best_performance = float("-inf")
         clean_print("Snapshot not found. Training model from scratch", "[Trainer]")
@@ -840,6 +650,8 @@ def main():
     clean_print("Done.", "[INFO]")
     if is_main_rank() and wandb is not None and wandb.run is not None:
         wandb.finish()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

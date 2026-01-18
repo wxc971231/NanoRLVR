@@ -1,0 +1,55 @@
+{
+    "Paths": {
+        "model_path": "checkpoints/Qwen3-0.6B",
+        "resume_path": null,
+        "train_jsonl": "data/gsm8k/train.jsonl",
+        "test_jsonl": "data/gsm8k/test.jsonl"
+    },
+    "LoRA": {
+        "use_lora": true,
+        "lora_r": 16,
+        "lora_alpha": 32,
+        "lora_dropout": 0.05
+    },
+    "Wandb": {
+        "wandb_project": "RLVR",
+        "wandb_group_enforce": null,
+        "wandb_name_enforce": "Debug",
+        "wandb_offline": true
+    },
+    "Training": {
+        "total_steps": 500,
+        "batch_size": 8,
+        "prompt_batch_size": 4,
+        "group_size": 8,
+        "chunk_size": 4,
+        "max_new_tokens": 768,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "seed": 42,
+        "bf16": true,
+        "gradient_checkpointing": false,
+        "ratio_len_norm": true,
+        "world_size": 6
+    },
+    "Evaluation": {
+        "eval_skip_first": true,
+        "eval_every": 5,
+        "eval_batches": 2,
+        "eval_batch_size": 8,
+        "save_every": null,
+        "save_best": 3
+    },
+    "Optimization": {
+        "lr": 1e-05,
+        "weight_decay": 0.0,
+        "optim": "adamw",
+        "max_grad_norm": 1.0
+    },
+    "GRPO": {
+        "disable_ref": true,
+        "clip_eps": 0.0004,
+        "kl_beta": 0.2,
+        "k_epochs": 3
+    }
+}

@@ -9,10 +9,11 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Tuple
 from transformers import AutoTokenizer
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
+from dataclasses import dataclass
 
 # ---------------------------
 # utils: basic
@@ -101,10 +102,13 @@ def ddp_init():
     num_cores = os.cpu_count()
     num_threads = max(1, min(16, num_cores // 2))    # Each process uses part of the CPU cores
     os.environ["OMP_NUM_THREADS"] = str(num_threads)
-    dist.init_process_group(backend="nccl")
     RANK = int(os.environ["RANK"])
     LOCAL_RANK = int(os.environ["LOCAL_RANK"])
     WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
     torch.cuda.set_device(LOCAL_RANK)
 
     return RANK, LOCAL_RANK, WORLD_SIZE
@@ -238,49 +242,102 @@ def build_completion_mask_targets(
     mask = (pos >= start) & (attention_mask[:, 1:] == 1)    # [B*G, L-1]
     return mask
 
-def compute_token_logps(
+def compute_token_logps_and_values(
     model: nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     autocast_dtype: torch.dtype,
     require_grad: bool,
     chunk_size: int = 4,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Return token log-probabilities for each next-token target (input_ids[:, 1:]), predicted by logits[:, :-1].
     Shape: [B*G, max_traj_L-1]
     If require_grad is False, splits input into chunks to save memory.
     """
+    calc_values = hasattr(model, "v_head")
     if not require_grad:
         # Chunked inference to save memory
         B_full = input_ids.shape[0]
         all_tok_logps = []
+        all_values = [] if calc_values else None
         for i in range(0, B_full, chunk_size):
             chunk_ids = input_ids[i : i + chunk_size]               # [chunk_B, L]
             chunk_mask = attention_mask[i : i + chunk_size]         # [chunk_B, L]
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                out = model(input_ids=chunk_ids, attention_mask=chunk_mask, use_cache=False)
+                out = model(input_ids=chunk_ids, attention_mask=chunk_mask, output_hidden_states=calc_values, use_cache=False,)
                 logits = out.logits                                 # [chunk_B, L, V]
                 logp = F.log_softmax(logits[:, :-1, :], dim=-1)     # [chunk_B, L-1, V]
                 tgt = chunk_ids[:, 1:]                              # [chunk_B, L-1]
                 tok_logp = torch.gather(logp, dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)  # [chunk_B, L-1]
                 all_tok_logps.append(tok_logp)
+                if calc_values:
+                    # find the idx of last vaild token
+                    hidden = out.hidden_states[-1]
+                    L = chunk_mask.size(1)
+                    pos = torch.arange(L, device=hidden.device).unsqueeze(0)    # [1, L]
+                    last_idx = (chunk_mask.to(torch.long) * pos).amax(dim=1)    # [chunk_B]
+                    
+                    # project hidden states to values
+                    hidden_last = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
+                    all_values.append(model.v_head(hidden_last).squeeze(-1))   
         
-        all_tok_logps = torch.cat(all_tok_logps, dim=0)             # [B, L-1]
-        return all_tok_logps
+        all_tok_logps = torch.cat(all_tok_logps, dim=0)                     # [B, L-1]
+        all_values = torch.cat(all_values, dim=0) if all_values else None   # [B]    
+        return all_tok_logps, all_values
     else:
+        values = None
         with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = out.logits # [B, L, V]
+            out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=calc_values, use_cache=False)
+            logits = out.logits                             # [B, L, V]
 
-        logp = F.log_softmax(logits[:, :-1, :], dim=-1)             # [B, L-1, V]
-        tgt = input_ids[:, 1:]                                      # [B, L-1]
+        logp = F.log_softmax(logits[:, :-1, :], dim=-1)     # [B, L-1, V]
+        tgt = input_ids[:, 1:]                              # [B, L-1]
         tok_logp = torch.gather(logp, dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
-        return tok_logp
+        
+        if calc_values:    
+            # find the idx of last vaild token
+            hidden = out.hidden_states[-1]
+            L = attention_mask.size(1)
+            pos = torch.arange(L, device=hidden.device).unsqueeze(0)        # [1, L]
+            last_idx = (attention_mask.to(torch.long) * pos).amax(dim=1)    # [B]
+
+            # project hidden states to values
+            hidden_last = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
+            values = model.v_head(hidden_last).squeeze(-1)
+        return tok_logp, values
+
+
 
 # ---------------------------
 # utils: rollout + eval
 # ---------------------------
+@dataclass
+class RolloutBatch:
+    # flattened batch size N = B * G
+    input_ids: torch.Tensor                 # [B*G, max_traj_len]
+    attention_mask: torch.Tensor            # [B*G, max_traj_len]
+    old_logp_tok: torch.Tensor              # [B*G, max_traj_len-1] token logp under π_old (for ratio)
+    ref_logp_tok: Optional[torch.Tensor]    # [B*G, max_traj_len-1] token logp under π_ref (for KL); None if disabled
+    completion_mask: torch.Tensor           # [B*G, max_traj_len-1] (completion token mask)
+    completion_lens: torch.Tensor           # [B*G] (number of completion tokens)
+    prompt_lens: torch.Tensor               # [B*G] (prompt boundary index, used for masking)
+    rewards: torch.Tensor                   # [B*G]
+    advantages: torch.Tensor                # [B*G]
+    
+    def __getitem__(self, index):
+        return RolloutBatch(
+            input_ids=self.input_ids[index],
+            attention_mask=self.attention_mask[index],
+            old_logp_tok=self.old_logp_tok[index],
+            ref_logp_tok=self.ref_logp_tok[index] if self.ref_logp_tok is not None else None,
+            completion_mask=self.completion_mask[index],
+            completion_lens=self.completion_lens[index],
+            prompt_lens=self.prompt_lens[index],
+            rewards=self.rewards[index],
+            advantages=self.advantages[index],
+        )
+
 @torch.no_grad()
 def rollout(
     model: nn.Module,
@@ -295,7 +352,7 @@ def rollout(
     kl_beta: float,
     autocast_dtype: torch.dtype,
     device: Union[int, torch.device],
-    prompt_batch_size: int = 4
+    prompt_batch_size: int = 4,
 ) -> Dict[str, torch.Tensor]:
     """
     Generate G samples per prompt. Compute reward and group-normalized advantages.
@@ -312,6 +369,8 @@ def rollout(
     iterator = tqdm.tqdm(range(0, B, prompt_batch_size), desc=f"[Rank {rank}] Rollout", leave=False, position=rank)
     chunk_results = []
     for start_idx in iterator:
+        chunk_res = {}
+
         # Slice inputs and move to device
         end_idx = min(start_idx + prompt_batch_size, B)
         a_chunk = batch_answers[start_idx:end_idx]
@@ -355,7 +414,7 @@ def rollout(
         rewards_t = torch.tensor(rewards, device=device, dtype=torch.float32)   # [chunk_B*G]
 
         # Old logp
-        old_logp_tok = compute_token_logps(     # [chunk_B*G, max_traj_L-1]
+        old_logp_tok, critic_values = compute_token_logps_and_values(
             model=gen_model,
             input_ids=out_ids,
             attention_mask=out_attn,
@@ -363,32 +422,40 @@ def rollout(
             require_grad=False,
         )
         
-        # Ref logp
-        ref_logp_tok = None
+        # completion mask
+        comp_mask = build_completion_mask_targets(out_attn, prompt_boundary_rep).to(dtype=old_logp_tok.dtype)
+        completion_lens = comp_mask.sum(dim=1)
+
+        # Store results
+        chunk_res.update({
+            "out_ids": out_ids,                 # [chunk_B*G, max_traj_L]
+            "out_attn": out_attn,               # [chunk_B*G, max_traj_L]
+            "old_logp_tok": old_logp_tok,       # [chunk_B*G, max_traj_L-1]
+            "rewards": rewards_t,               # [chunk_B*G, ]
+            "prompt_lens": prompt_boundary_rep, # [chunk_B*G, ]
+            "completion_lens": completion_lens, # [chunk_B*G, ]
+            "completion_mask": comp_mask,       # [chunk_B*G, max_traj_L-1]
+        })
+        
+        # Extra: Ref logp
         if ref_model is not None and kl_beta > 0.0:
-            ref_logp_tok = compute_token_logps( # [chunk_B*G, max_traj_L-1]
+            ref_logp_tok, _ = compute_token_logps_and_values( 
                 model=ref_model,
                 input_ids=out_ids,
                 attention_mask=out_attn,
                 autocast_dtype=autocast_dtype,
                 require_grad=False,
             )
+            chunk_res.update({
+                "ref_logp_tok": ref_logp_tok    # [chunk_B*G, max_traj_L-1]
+            })
+        # Extra: Critic values
+        if critic_values is not None:
+            chunk_res.update({
+                "critic_values": critic_values  # [chunk_B*G, ]
+            })
 
-        # completion mask
-        comp_mask = build_completion_mask_targets(out_attn, prompt_boundary_rep)
-        completion_lens = comp_mask.sum(dim=1)                                  
-
-        # Store results
-        chunk_results.append({
-            "out_ids": out_ids,                 # [chunk_B*G, max_traj_L]
-            "out_attn": out_attn,               # [chunk_B*G, max_traj_L]
-            "old_logp_tok": old_logp_tok,       # [chunk_B*G, max_traj_L-1]
-            "ref_logp_tok": ref_logp_tok,       # [chunk_B*G, max_traj_L-1] or None
-            "rewards": rewards_t,               # [chunk_B*G, ]
-            "prompt_lens": prompt_boundary_rep, # [chunk_B*G, ]
-            "completion_lens": completion_lens, # [chunk_B*G, ]
-            "completion_mask": comp_mask,       # [chunk_B*G, max_traj_L-1]
-        })
+        chunk_results.append(chunk_res)
     
     # Combine results and pad to max_traj_len
     max_traj_len = max(res["out_ids"].size(1) for res in chunk_results)  
@@ -396,21 +463,18 @@ def rollout(
     for res in chunk_results:
         # Pad to max_traj_len
         pad_len = max_traj_len - res["out_ids"].size(1)
-        res['out_ids'] = res["out_ids"] if pad_len == 0 else \
-                        F.pad(res["out_ids"], (0, pad_len), value=tokenizer.pad_token_id)
-        res['out_attn'] = res["out_attn"] if pad_len == 0 else \
-                        F.pad(res["out_attn"], (0, pad_len), value=0)
-        res['ref_logp_tok'] = res['ref_logp_tok'] if (pad_len == 0 or res['ref_logp_tok'] is None) else \
-                        F.pad(res["ref_logp_tok"], (0, pad_len), value=0.0)
-        res['old_logp_tok'] = res["old_logp_tok"] if pad_len == 0 else \
-                        F.pad(res["old_logp_tok"], (0, pad_len), value=0.0)
-        res['completion_mask'] = res["completion_mask"] if pad_len == 0 else \
-                        F.pad(res["completion_mask"], (0, pad_len), value=0)
+        if pad_len > 0:
+            res['out_ids'] = F.pad(res["out_ids"], (0, pad_len), value=tokenizer.pad_token_id)
+            res['out_attn'] = F.pad(res["out_attn"], (0, pad_len), value=0)
+            res['old_logp_tok'] = F.pad(res["old_logp_tok"], (0, pad_len), value=0.0)
+            res['completion_mask'] = F.pad(res["completion_mask"], (0, pad_len), value=0)
+            if "ref_logp_tok" in res:
+                res["ref_logp_tok"] = F.pad(res["ref_logp_tok"], (0, pad_len), value=0.0)
 
         for k, v in res.items():
             all_chunk_res[k].append(v)
 
-    all_chunk_res = {k: None if v[0] is None else torch.cat(v, dim=0) for k, v in all_chunk_res.items()}
+    all_chunk_res = {k: torch.cat(v, dim=0) for k, v in all_chunk_res.items()}
     return all_chunk_res
 
 @torch.no_grad()
