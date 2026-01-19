@@ -4,15 +4,14 @@ import json
 import random
 import tqdm
 import shutil
+import argparse
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from typing import Optional, List, Dict, Union, Tuple
 from transformers import AutoTokenizer
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
 from dataclasses import dataclass
 
 # ---------------------------
@@ -112,6 +111,85 @@ def ddp_init():
     torch.cuda.set_device(LOCAL_RANK)
 
     return RANK, LOCAL_RANK, WORLD_SIZE
+
+
+def parse_basic_args(default_config_path:str):
+    # 1. First pass: Check for --config argument
+    conf_parser = argparse.ArgumentParser(add_help=False)
+    conf_parser.add_argument("--config", type=str, default=default_config_path, help="Path to JSON config file")
+    known_args, remaining_args = conf_parser.parse_known_args()
+
+    # 2. Load config if exists
+    defaults = {}
+    if known_args.config and os.path.exists(known_args.config):
+        clean_print(f'Loading configuration from {known_args.config}', '[INFO]')
+        with open(known_args.config, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+            # Flatten the nested config for argparse
+            for k, v in config_data.items():
+                if isinstance(v, dict):
+                    defaults.update(v)
+                else:
+                    defaults[k] = v
+    else:
+        clean_print(f"Config file {known_args.config} not found. Using defaults.", '[INFO]')
+    
+    # 3. Define main parser
+    p = argparse.ArgumentParser(parents=[conf_parser])
+    
+    # --- Group: Paths ---
+    g_path = p.add_argument_group("Paths")
+    g_path.add_argument("--model_path", type=str, default=None)
+    g_path.add_argument("--resume_path", type=str, default=None)
+    g_path.add_argument("--train_jsonl", type=str, default=None)
+    g_path.add_argument("--test_jsonl", type=str, default=None)
+
+    # --- Group: Training Hypers ---
+    g_train = p.add_argument_group("Training")
+    g_train.add_argument("--total_steps", type=int, default=2000)
+    g_train.add_argument("--batch_size", type=int, default=8, help="prompts per rank within a rollout")
+    g_train.add_argument("--prompt_batch_size", type=int, default=4, help="prompts per generation chunk within a rollout")
+    g_train.add_argument("--group_size", type=int, default=8, help="samples per prompt within a rollout")
+    g_train.add_argument("--chunk_size", type=int, default=4, help="Mini-batch size for gradient accumulation within a rollout")
+    g_train.add_argument("--max_new_tokens", type=int, default=512)
+    g_train.add_argument("--temperature", type=float, default=1.0)
+    g_train.add_argument("--top_p", type=float, default=0.95)
+    g_train.add_argument("--seed", type=int, default=42)
+    g_train.add_argument("--bf16", action="store_true")
+    g_train.add_argument("--gradient_checkpointing", action="store_true")
+    g_train.add_argument("--ratio_len_norm", action="store_true")
+
+    # --- Group: Optimization ---
+    g_optim = p.add_argument_group("Optimization")
+    g_optim.add_argument("--lr", type=float, default=2e-6)
+    g_optim.add_argument("--weight_decay", type=float, default=0.0)
+    g_optim.add_argument("--optim", type=str, default="adamw", choices=["adamw", "adamw8bit"])
+    g_optim.add_argument("--max_grad_norm", type=float, default=1.0)
+
+    # --- Group: Evaluation & Saving ---
+    g_eval = p.add_argument_group("Evaluation")
+    g_eval.add_argument("--eval_skip_first", action="store_true")
+    g_eval.add_argument("--eval_every", type=int, default=5)
+    g_eval.add_argument("--eval_batches", type=int, default=10)
+    g_eval.add_argument("--eval_batch_size", type=int, default=8, help="prompts per step (per rank)")
+    g_eval.add_argument("--save_every", type=int, default=None)
+    g_eval.add_argument("--save_best", type=int, default=5)
+
+    # --- Group: Wandb ---
+    g_wandb = p.add_argument_group("Wandb")
+    g_wandb.add_argument("--wandb_project", type=str, default="grpo-gsm8k", help="Wandb project name")
+    g_wandb.add_argument("--wandb_group_enforce", type=str, default=None, help="If not set, use auto group name")
+    g_wandb.add_argument("--wandb_name_enforce", type=str, default=None, help="If not set, use auto name")
+    g_wandb.add_argument("--wandb_offline", action="store_true", help="Run wandb in offline mode")
+
+    # --- Group: LoRA ---
+    g_lora = p.add_argument_group("LoRA")
+    g_lora.add_argument("--use_lora", action="store_true")
+    g_lora.add_argument("--lora_r", type=int, default=16, help='Rank of the LoRA matrices')
+    g_lora.add_argument("--lora_alpha", type=int, default=32, help='Scaling factor for the LoRA weights')
+    g_lora.add_argument("--lora_dropout", type=float, default=0.05)
+
+    return p, defaults, remaining_args
 
 # ---------------------------
 # GSM8K: load + parse
@@ -255,7 +333,8 @@ def compute_token_logps_and_values(
     Shape: [B*G, max_traj_L-1]
     If require_grad is False, splits input into chunks to save memory.
     """
-    calc_values = hasattr(model, "v_head")
+    base_model = model.module if hasattr(model, "module") else model
+    calc_values = hasattr(base_model, "v_head")
     if not require_grad:
         # Chunked inference to save memory
         B_full = input_ids.shape[0]
@@ -265,7 +344,12 @@ def compute_token_logps_and_values(
             chunk_ids = input_ids[i : i + chunk_size]               # [chunk_B, L]
             chunk_mask = attention_mask[i : i + chunk_size]         # [chunk_B, L]
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                out = model(input_ids=chunk_ids, attention_mask=chunk_mask, output_hidden_states=calc_values, use_cache=False,)
+                out = base_model(
+                    input_ids=chunk_ids,
+                    attention_mask=chunk_mask,
+                    output_hidden_states=calc_values,
+                    use_cache=False,
+                )
                 logits = out.logits                                 # [chunk_B, L, V]
                 logp = F.log_softmax(logits[:, :-1, :], dim=-1)     # [chunk_B, L-1, V]
                 tgt = chunk_ids[:, 1:]                              # [chunk_B, L-1]
@@ -280,7 +364,7 @@ def compute_token_logps_and_values(
                     
                     # project hidden states to values
                     hidden_last = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
-                    all_values.append(model.v_head(hidden_last).squeeze(-1))   
+                    all_values.append(base_model.v_head(hidden_last).squeeze(-1))   
         
         all_tok_logps = torch.cat(all_tok_logps, dim=0)                     # [B, L-1]
         all_values = torch.cat(all_values, dim=0) if all_values else None   # [B]    
@@ -288,23 +372,29 @@ def compute_token_logps_and_values(
     else:
         values = None
         with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-            out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=calc_values, use_cache=False)
+            assert hasattr(model, "module"), "Backbone model must be ddp wrapped when require_grad is True"
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=calc_values,
+                use_cache=False,
+            )
             logits = out.logits                             # [B, L, V]
+
+            if calc_values:    
+                # find the idx of last vaild token
+                hidden = out.hidden_states[-1]
+                L = attention_mask.size(1)
+                pos = torch.arange(L, device=hidden.device).unsqueeze(0)        # [1, L]
+                last_idx = (attention_mask.to(torch.long) * pos).amax(dim=1)    # [B]
+
+                # project hidden states to values
+                hidden_last = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
+                values = base_model.v_head(hidden_last).squeeze(-1)
 
         logp = F.log_softmax(logits[:, :-1, :], dim=-1)     # [B, L-1, V]
         tgt = input_ids[:, 1:]                              # [B, L-1]
         tok_logp = torch.gather(logp, dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
-        
-        if calc_values:    
-            # find the idx of last vaild token
-            hidden = out.hidden_states[-1]
-            L = attention_mask.size(1)
-            pos = torch.arange(L, device=hidden.device).unsqueeze(0)        # [1, L]
-            last_idx = (attention_mask.to(torch.long) * pos).amax(dim=1)    # [B]
-
-            # project hidden states to values
-            hidden_last = hidden[torch.arange(hidden.size(0), device=hidden.device), last_idx]
-            values = model.v_head(hidden_last).squeeze(-1)
         return tok_logp, values
 
 

@@ -14,13 +14,11 @@ Notes:
 import os
 import time
 import random
-import argparse
 import glob
 import tqdm
 import wandb
 import numpy as np
 from pprint import pprint
-from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Union
 import torch
@@ -169,87 +167,15 @@ def grpo_loss(
 # main
 # ---------------------------
 def parse_args():
-    # 1. First pass: Check for --config argument
-    conf_parser = argparse.ArgumentParser(add_help=False)
-    conf_parser.add_argument("--config", type=str, default="config/grpo_config.json", help="Path to JSON config file")
-    known_args, remaining_args = conf_parser.parse_known_args()
-
-    # 2. Load config if exists
-    defaults = {}
-    if known_args.config and os.path.exists(known_args.config):
-        clean_print(f'Loading configuration from {known_args.config}', '[INFO]')
-        with open(known_args.config, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-            # Flatten the nested config for argparse
-            for k, v in config_data.items():
-                if isinstance(v, dict):
-                    defaults.update(v)
-                else:
-                    defaults[k] = v
-    else:
-        clean_print(f"Config file {known_args.config} not found. Using defaults.", '[INFO]')
-
-    # 3. Define main parser
-    p = argparse.ArgumentParser(parents=[conf_parser])
+    # Load basic args
+    p, defaults, remaining_args = parse_basic_args(default_config_path="config/grpo_config.json")
     
-    # --- Group: Paths ---
-    g_path = p.add_argument_group("Paths")
-    g_path.add_argument("--model_path", type=str, default=None)
-    g_path.add_argument("--resume_path", type=str, default=None)
-    g_path.add_argument("--train_jsonl", type=str, default=None)
-    g_path.add_argument("--test_jsonl", type=str, default=None)
-
-    # --- Group: Training Hypers ---
-    g_train = p.add_argument_group("Training")
-    g_train.add_argument("--total_steps", type=int, default=2000)
-    g_train.add_argument("--batch_size", type=int, default=8, help="prompts per rank within a rollout")
-    g_train.add_argument("--prompt_batch_size", type=int, default=4, help="prompts per generation chunk within a rollout")
-    g_train.add_argument("--group_size", type=int, default=8, help="samples per prompt within a rollout")
-    g_train.add_argument("--chunk_size", type=int, default=4, help="Mini-batch size for gradient accumulation within a rollout")
-    g_train.add_argument("--max_new_tokens", type=int, default=512)
-    g_train.add_argument("--temperature", type=float, default=1.0)
-    g_train.add_argument("--top_p", type=float, default=0.95)
-    g_train.add_argument("--seed", type=int, default=42)
-    g_train.add_argument("--bf16", action="store_true")
-    g_train.add_argument("--gradient_checkpointing", action="store_true")
-    g_train.add_argument("--ratio_len_norm", action="store_true")
-
-    # --- Group: Optimization ---
-    g_optim = p.add_argument_group("Optimization")
-    g_optim.add_argument("--lr", type=float, default=2e-6)
-    g_optim.add_argument("--weight_decay", type=float, default=0.0)
-    g_optim.add_argument("--optim", type=str, default="adamw", choices=["adamw", "adamw8bit"])
-    g_optim.add_argument("--max_grad_norm", type=float, default=1.0)
-
-    # --- Group: GRPO ---
+    # Group: GRPO
     g_rl = p.add_argument_group("GRPO")
     g_rl.add_argument("--clip_eps", type=float, default=0.2)
     g_rl.add_argument("--kl_beta", type=float, default=0.02)
     g_rl.add_argument("--k_epochs", type=int, default=2)
     g_rl.add_argument("--disable_ref", action="store_true", help="Disable KL regularization by not using reference model.")
-
-    # --- Group: Evaluation & Saving ---
-    g_eval = p.add_argument_group("Evaluation")
-    g_eval.add_argument("--eval_skip_first", action="store_true")
-    g_eval.add_argument("--eval_every", type=int, default=5)
-    g_eval.add_argument("--eval_batches", type=int, default=10)
-    g_eval.add_argument("--eval_batch_size", type=int, default=8, help="prompts per step (per rank)")
-    g_eval.add_argument("--save_every", type=int, default=None)
-    g_eval.add_argument("--save_best", type=int, default=5)
-
-    # --- Group: Wandb ---
-    g_wandb = p.add_argument_group("Wandb")
-    g_wandb.add_argument("--wandb_project", type=str, default="grpo-gsm8k", help="Wandb project name")
-    g_wandb.add_argument("--wandb_group_enforce", type=str, default=None, help="If not set, use auto group name")
-    g_wandb.add_argument("--wandb_name_enforce", type=str, default=None, help="If not set, use auto name")
-    g_wandb.add_argument("--wandb_offline", action="store_true", help="Run wandb in offline mode")
-
-    # --- Group: LoRA ---
-    g_lora = p.add_argument_group("LoRA")
-    g_lora.add_argument("--use_lora", action="store_true")
-    g_lora.add_argument("--lora_r", type=int, default=16, help='Rank of the LoRA matrices')
-    g_lora.add_argument("--lora_alpha", type=int, default=32, help='Scaling factor for the LoRA weights')
-    g_lora.add_argument("--lora_dropout", type=float, default=0.05)
 
     # Apply defaults from config file (this overrides argparse defaults but is overridden by CLI args)
     p.set_defaults(**defaults)

@@ -46,7 +46,7 @@
         "optim": "adamw",
         "max_grad_norm": 1.0
     },
-    "GRPO": {
+    "PPO": {
         "disable_ref": true,
         "clip_eps": 0.0004,
         "kl_beta": 0.2,
