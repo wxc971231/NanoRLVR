@@ -127,14 +127,9 @@ def ppo_loss(
         log_ratio = (logp_new_sum - logp_old_sum).clamp(-20, 20)
         ratio = torch.exp(log_ratio)
     
-    # clipped surrogate
-    A = batch.advantages.detach()
-    unclipped = ratio * A
-    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * A
-    policy_loss = -torch.mean(torch.minimum(unclipped, clipped))
-
-    # KL penalty to reference model (token-level)
-    kl = torch.tensor(0.0, device=policy_loss.device)
+    # KL reward shaping to reference model (token-level)
+    kl_penalty = torch.zeros_like(batch.rewards)
+    kl = torch.tensor(0.0, device=ratio.device)
     if batch.ref_logp_tok is not None and kl_beta > 0.0:
         ref_tok = batch.ref_logp_tok.detach()
         if ratio_len_norm:
@@ -143,11 +138,19 @@ def ppo_loss(
         else:
             kl_per_seq = ((tok_logp_new - ref_tok) * comp_mask).sum(dim=1)
         kl = kl_per_seq.mean()
+        kl_penalty = kl_beta * kl_per_seq.detach()
+
+    A = (batch.advantages - kl_penalty).detach()
+
+    # clipped surrogate
+    unclipped = ratio * A
+    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * A
+    policy_loss = -torch.mean(torch.minimum(unclipped, clipped))
 
     # 在 MSE Loss 中混合 ft32 和 bf16 会报错，所以这里都转换为 ft32
-    value_targets = batch.rewards.detach()
+    value_targets = (batch.rewards - kl_penalty).detach()
     value_loss = F.mse_loss(values_new.float(), value_targets.float())
-    loss = policy_loss + kl_beta * kl + value_coef * value_loss
+    loss = policy_loss + value_coef * value_loss
 
     stats = {
         "loss": loss.detach(),
@@ -158,7 +161,7 @@ def ppo_loss(
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
         "reward_mean": batch.rewards.mean().detach(),
-        "adv_mean": batch.advantages.mean().detach(),
+        "adv_mean": A.mean().detach(),
         "len_mean": batch.completion_lens.float().mean().detach(),
     }
     return loss, stats
@@ -199,7 +202,13 @@ def main():
     exp_group_name = args.wandb_group_enforce if args.wandb_group_enforce is not None else \
         f'PPO-{args.model_path.split("/")[-1]}-LoRA' if args.use_lora else \
         f'PPO-{args.model_path.split("/")[-1]}'
-    args.save_dir = f"runs/{exp_group_name}/{timestamp}"
+    exp_name = args.wandb_name_enforce if args.wandb_name_enforce is not None else timestamp
+    args.save_dir = f"runs/{exp_group_name}/{exp_name}"
+    if os.path.exists(args.save_dir) and args.resume_path is not None and args.save_dir not in args.resume_path:
+        clean_print(f"save_dir {args.save_dir} already exists. You can resume training by setting --resume_path.", '[Error]')
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        exit(0)
 
     # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, fix_mistral_regex=True)
@@ -224,6 +233,8 @@ def main():
     if hidden_size is None and hasattr(model, "lm_head"):
         hidden_size = model.lm_head.in_features
     model.v_head = nn.Linear(hidden_size, 1, dtype=autocast_dtype).to(LOCAL_RANK) # add value head for critic
+    torch.nn.init.zeros_(model.v_head.weight)   # safe init
+    torch.nn.init.zeros_(model.v_head.bias)     # safe init
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[LOCAL_RANK], find_unused_parameters=False)
 
@@ -273,7 +284,7 @@ def main():
     # wandb init
     if is_main_rank() and wandb is not None:
         wandb.init(
-            project=args.wandb_project, group=exp_group_name, name=timestamp,
+            project=args.wandb_project, group=exp_group_name, name=exp_name,
             config=vars(args), dir="Wandb",
             id=wandb_id, resume="allow",
             mode="offline" if args.wandb_offline else "online",

@@ -131,14 +131,9 @@ def grpo_loss(
         log_ratio = (logp_new_sum - logp_old_sum).clamp(-20, 20)
         ratio = torch.exp(log_ratio)
 
-    # clipped surrogate
-    A = batch.advantages.detach()
-    unclipped = ratio * A
-    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * A
-    policy_loss = -torch.mean(torch.minimum(unclipped, clipped))
-
-    # KL penalty to reference model (token-level)
-    kl = torch.tensor(0.0, device=policy_loss.device)
+    # KL reward shaping to reference model (token-level)
+    kl_penalty = torch.zeros_like(batch.rewards)
+    kl = torch.tensor(0.0, device=ratio.device)
     if batch.ref_logp_tok is not None and kl_beta > 0.0:
         ref_tok = batch.ref_logp_tok.detach()
         if ratio_len_norm:
@@ -147,9 +142,16 @@ def grpo_loss(
         else:
             kl_per_seq = ((tok_logp_new - ref_tok) * comp_mask).sum(dim=1)  # [N]
         kl = kl_per_seq.mean()
+        kl_penalty = kl_beta * kl_per_seq.detach()
+
+    # clipped surrogate
+    A = (batch.advantages - kl_penalty).detach()
+    unclipped = ratio * A
+    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * A
+    policy_loss = -torch.mean(torch.minimum(unclipped, clipped))
 
     # GRPO loss
-    loss = policy_loss + kl_beta * kl
+    loss = policy_loss
 
     stats = {
         "loss": loss.detach(),
@@ -158,7 +160,7 @@ def grpo_loss(
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
         "reward_mean": batch.rewards.mean().detach(),
-        "adv_mean": batch.advantages.mean().detach(),
+        "adv_mean": A.mean().detach(),
         "len_mean": batch.completion_lens.float().mean().detach(),
     }
     return loss, stats
@@ -198,7 +200,12 @@ def main():
                 f'GRPO-{args.model_path.split("/")[-1]}-LoRA' if args.use_lora else \
                 f'GRPO-{args.model_path.split("/")[-1]}'
     exp_name = args.wandb_name_enforce if args.wandb_name_enforce is not None else timestamp
-    args.save_dir =f'runs/{exp_group_name}/{exp_name}'
+    args.save_dir = f"runs/{exp_group_name}/{exp_name}"
+    if os.path.exists(args.save_dir) and args.resume_path is not None and args.save_dir not in args.resume_path:
+        clean_print(f"save_dir {args.save_dir} already exists. You can resume training by setting --resume.", '[Error]')
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        exit(0)
     
     # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, fix_mistral_regex=True)

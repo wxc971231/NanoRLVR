@@ -14,14 +14,14 @@
     "Wandb": {
         "wandb_project": "RLVR",
         "wandb_group_enforce": null,
-        "wandb_name_enforce": "Debug",
-        "wandb_offline": true
+        "wandb_name_enforce": "Update3-KL0.05-value0.0001-clip0.0004",
+        "wandb_offline": false
     },
     "Training": {
         "total_steps": 500,
-        "batch_size": 8,
-        "prompt_batch_size": 4,
-        "group_size": 8,
+        "batch_size": 256,
+        "group_size": 1,
+        "prompt_batch_size": 52,
         "chunk_size": 4,
         "max_new_tokens": 768,
         "temperature": 1.0,
@@ -33,10 +33,10 @@
         "world_size": 6
     },
     "Evaluation": {
-        "eval_skip_first": true,
+        "eval_skip_first": false,
         "eval_every": 5,
-        "eval_batches": 2,
-        "eval_batch_size": 8,
+        "eval_batches": 4,
+        "eval_batch_size": 48,
         "save_every": null,
         "save_best": 3
     },
@@ -47,9 +47,10 @@
         "max_grad_norm": 1.0
     },
     "PPO": {
-        "disable_ref": true,
+        "disable_ref": false,
         "clip_eps": 0.0004,
-        "kl_beta": 0.2,
-        "k_epochs": 3
+        "kl_beta": 0.05,
+        "k_epochs": 3,
+        "value_coef": 1e-4
     }
 }

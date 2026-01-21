@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
+import nunmpy as np
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from typing import Optional, List, Dict, Union, Tuple
 from transformers import AutoTokenizer
@@ -48,9 +49,15 @@ def assert_finite_grad(model: nn.Module) -> bool:
     return True
 
 def set_seed(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 def clean_print(str:str, prefix:str=''):
     if is_main_rank():
@@ -578,6 +585,7 @@ def evaluate_greedy(
     eval_batches: int,
 ) -> Dict[str, float]:
     model_eval = model.module if hasattr(model, "module") else model
+    model_eval.eval()
 
     # Only show progress bar on main rank
     correct_cnt, total_cnt = 0, 0
@@ -598,8 +606,8 @@ def evaluate_greedy(
 
         with torch.autocast(device_type="cuda", dtype=autocast_dtype):
             out = model_eval.generate(
-                input_ids=input_ids,    # [eval_B, L]
-                attention_mask=attn,    # [eval_B, L]
+                input_ids=input_ids,
+                attention_mask=attn,
                 do_sample=False,
                 temperature=None,
                 top_k=None,
@@ -607,7 +615,7 @@ def evaluate_greedy(
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,         # Force use_cache=True during rollout for speed, even if gradient checkpointing disables it globally
+                use_cache=True,
             )
 
         pad_id = tokenizer.pad_token_id
@@ -619,7 +627,7 @@ def evaluate_greedy(
         texts = tokenizer.batch_decode(out, skip_special_tokens=True)
         for t, gt in zip(texts, answers):
             r = gsm8k_reward(t, gt)
-            correct_cnt += int(r > 0.5)   # gsm8k_reward ∈ {0.0,1.0}，用 >0.5 保证可扩展性（比如做了平滑）
+            correct_cnt += int(r > 0.5)
             total_cnt += 1
 
     corr_t = torch.tensor([correct_cnt], device=device, dtype=torch.float32)
