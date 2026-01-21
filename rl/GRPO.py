@@ -201,8 +201,8 @@ def main():
                 f'GRPO-{args.model_path.split("/")[-1]}'
     exp_name = args.wandb_name_enforce if args.wandb_name_enforce is not None else timestamp
     args.save_dir = f"runs/{exp_group_name}/{exp_name}"
-    if os.path.exists(args.save_dir) and args.resume_path is not None and args.save_dir not in args.resume_path:
-        clean_print(f"save_dir {args.save_dir} already exists. You can resume training by setting --resume.", '[Error]')
+    if os.path.exists(args.save_dir) and (args.resume_path is None or args.save_dir not in args.resume_path):
+        clean_print(f"Save_dir {args.save_dir} already exists. You can resume training by setting --resume.", '[Error]')
         if dist.is_initialized():
             dist.destroy_process_group()
         exit(0)

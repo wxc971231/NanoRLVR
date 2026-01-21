@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
-import nunmpy as np
+import numpy as np
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from typing import Optional, List, Dict, Union, Tuple
 from transformers import AutoTokenizer
@@ -51,6 +51,7 @@ def assert_finite_grad(model: nn.Module) -> bool:
 def set_seed(seed: int):
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     if torch.cuda.is_available():
@@ -592,7 +593,7 @@ def evaluate_greedy(
     total_gen_len = 0.0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     
-    iterator = dataloader if not is_main_rank() else tqdm.tqdm(dataloader, desc=f"[GPU0-{world_size-1}]: Evaluating", leave=False)
+    iterator = dataloader if not is_main_rank() else tqdm.tqdm(dataloader, desc=f"[GPU0-{world_size-1}]: Evaluating", leave=False, total=min(len(dataloader), eval_batches))
     for b, items in enumerate(iterator):
         if eval_batches is not None and b >= eval_batches:
             break
