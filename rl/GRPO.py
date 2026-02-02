@@ -124,15 +124,15 @@ def grpo_loss(
 
     # ratio: support optional length-normalization to stabilize long sequences
     if ratio_len_norm:
-        completion_len = comp_mask.sum(dim=1).float().clamp(min=1.0)
-        log_ratio = (logp_new_sum - logp_old_sum) / completion_len
-        ratio = torch.exp(log_ratio.clamp(-10, 10))
+        completion_len = comp_mask.sum(dim=1).float().clamp(min=1.0)    # [N]
+        log_ratio = (logp_new_sum - logp_old_sum) / completion_len      # [N]
+        ratio = torch.exp(log_ratio.clamp(-10, 10))                     # [N]
     else:
         log_ratio = (logp_new_sum - logp_old_sum).clamp(-20, 20)
         ratio = torch.exp(log_ratio)
 
     # KL reward shaping to reference model (token-level)
-    kl_penalty = torch.zeros_like(batch.rewards)
+    kl_penalty = torch.zeros_like(batch.rewards)                        # [N]
     kl = torch.tensor(0.0, device=ratio.device)
     if batch.ref_logp_tok is not None and kl_beta > 0.0:
         ref_tok = batch.ref_logp_tok.detach()
@@ -146,11 +146,12 @@ def grpo_loss(
 
     # clipped surrogate
     A = (batch.advantages - kl_penalty).detach()
-    unclipped = ratio * A
-    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * A
-    policy_loss = -torch.mean(torch.minimum(unclipped, clipped))
-
+    unclipped = ratio * A                                                   # [N]
+    clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * A        # [N]
+    clip_mask = (ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))     # [N]
+    
     # GRPO loss
+    policy_loss = -torch.mean(torch.minimum(unclipped, clipped))
     loss = policy_loss
 
     stats = {
@@ -159,6 +160,7 @@ def grpo_loss(
         "kl": kl.detach(),
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
+        "ratio_clip_mask": clip_mask.detach(),
         "reward_mean": batch.rewards.mean().detach(),
         "adv_mean": A.mean().detach(),
         "len_mean": batch.completion_lens.float().mean().detach(),
@@ -202,7 +204,7 @@ def main():
     exp_name = args.wandb_name_enforce if args.wandb_name_enforce is not None else timestamp
     args.save_dir = f"runs/{exp_group_name}/{exp_name}"
     if os.path.exists(args.save_dir) and (args.resume_path is None or args.save_dir not in args.resume_path):
-        clean_print(f"Save_dir {args.save_dir} already exists. You can resume training by setting --resume.", '[Error]')
+        clean_print(f"Save_dir {args.save_dir} already exists. You can resume training by setting --resume_path.", '[Error]')
         if dist.is_initialized():
             dist.destroy_process_group()
         exit(0)
@@ -386,6 +388,8 @@ def main():
         stats_last = None
         TOTAL_SIZE = rollout.input_ids.size(0)  # B*G (batch_size * group_size)
         CHUNK_SIZE = int(args.chunk_size)       # mini_batch_size
+        ratio_clip_sum_total = torch.tensor(0.0, device=LOCAL_RANK)
+        ratio_clip_count_total = torch.tensor(0.0, device=LOCAL_RANK)
 
         # update model for k_epochs
         model.train()
@@ -409,9 +413,12 @@ def main():
                     autocast_dtype=autocast_dtype,
                     ratio_len_norm=args.ratio_len_norm,
                 )
+                ratio_clip_mask = stats["ratio_clip_mask"]
+                ratio_clip_sum_total += ratio_clip_mask.float().sum().detach()
+                ratio_clip_count_total += torch.tensor(float(ratio_clip_mask.numel()), device=LOCAL_RANK).detach()
                 
                 # update progress bar
-                stats_tensor = {k: (v.detach() if torch.is_tensor(v) else torch.tensor(v, device=LOCAL_RANK)) for k, v in stats.items()}
+                stats_tensor = {k: (v.detach() if torch.is_tensor(v) else torch.tensor(v, device=LOCAL_RANK)) for k, v in stats.items() if k != "ratio_clip_mask"}
                 stats_synced = ddp_sync_stats_for_progress(stats_tensor)
                 if is_main_rank():
                     iterator.set_postfix(
@@ -435,6 +442,8 @@ def main():
                 
                 # Accumulate stats (weighted average)
                 for k_stat, v_stat in stats.items():
+                    if k_stat in ["ratio_clip_mask"]:
+                        continue
                     if k_stat not in step_stats:
                         step_stats[k_stat] = 0.0
                     step_stats[k_stat] += v_stat.item() * weight
@@ -455,10 +464,15 @@ def main():
             optimizer.step()
             assert_finite_model(model)
 
+        ratio_clip_sum_total = ddp_all_reduce_sum(ratio_clip_sum_total)
+        ratio_clip_count_total = ddp_all_reduce_sum(ratio_clip_count_total)
+        ratio_clip_frac_step = ratio_clip_sum_total / ratio_clip_count_total.clamp(min=1.0)
+
         if stats_last is not None:
             # reduce stats across ranks for logging
             for kk in list(stats_last.keys()):
                 stats_last[kk] = ddp_all_reduce_mean(stats_last[kk])
+            stats_last["ratio_clip_frac"] = ratio_clip_frac_step
 
         # ================ (5) log ================
         if is_main_rank() and stats_last is not None:
@@ -475,6 +489,7 @@ def main():
                     "train/reward": stats_last['reward_mean'].item(),
                     "train/length": stats_last['len_mean'].item(),
                     "train/ratio": stats_last['ratio_mean'].item(),
+                    "train/ratio_clip_frac": stats_last['ratio_clip_frac'].item(),
                     "train/grad_norm": stats_last['grad_norm'].item(),
                     "train/dt": dt,
                     "step": step

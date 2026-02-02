@@ -33,7 +33,7 @@
         "world_size": 6
     },
     "Evaluation": {
-        "eval_skip_first": false,
+        "eval_skip_first": true,
         "eval_every": 5,
         "eval_batches": 4,
         "eval_batch_size": 48,
